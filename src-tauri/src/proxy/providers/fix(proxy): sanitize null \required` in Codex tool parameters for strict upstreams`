@@ -1,0 +1,85 @@
+## Bug
+
+Codex CLI 0.150.0-alpha.8 (Codex Desktop) injects built-in MCP resource tools —
+`list_mcp_resources`, `read_mcp_resource`, `list_mcp_resource_templates` — whose
+`parameters` carry `"required": null` and `"additionalProperties": false`.
+
+CC Switch's Responses → Chat Completions bridge passes this schema through
+unchanged. Strict OpenAI-compatible upstreams (DeepSeek, one-api gateways,
+vLLM) reject it:
+
+> CC Switch local proxy failed while handling Codex endpoint /responses.
+> Provider: default; model: deepseek-v4-flash; upstream_status: HTTP 400;
+> cause: Invalid schema for function 'list_mcp_resources': null is not of type "array"
+
+## Root cause
+
+The 3.20.0 fix (`normalize_function_parameters`, #5315) only normalizes
+`parameters: null` and `parameters.type: null`. It does **not** handle:
+
+- `"required": null`  →  "null is not of type array"
+- `"additionalProperties": false` without a valid `required` array, which strict
+  gateways treat as strict-mode and demand the array for
+
+## Fix
+
+Extend the normalization with a recursive helper that also fixes `required` and
+the `additionalProperties: false` + missing-`required` combination, recursing
+into nested `properties` and `items`.
+
+<details><summary>patch</summary>
+
+```diff
+@@ -1267,18 +1267,66 @@ fn serialize_tool_definition_for_description(tool: &Value) -> String {
+ fn normalize_function_parameters(params: Option<&Value>) -> Value {
+     let mut params = match params {
+         Some(Value::Object(obj)) => Value::Object(obj.clone()),
+         _ => json!({"type": "object", "properties": {}}),
+     };
+-    if let Some(obj) = params.as_object_mut() {
+-        match obj.get("type").and_then(|v| v.as_str()) {
+-            Some("object") => {}
+-            _ => {
+-                obj.insert("type".to_string(), json!("object"));
+-            }
+-        }
+-    }
++    sanitize_parameter_schema(&mut params, true);
+     params
+ }
++
++fn sanitize_parameter_schema(schema: &mut Value, is_root: bool) {
++    let Value::Object(obj) = schema else {
++        return;
++    };
++    if is_root && obj.get("type").and_then(|v| v.as_str()) != Some("object") {
++        obj.insert("type".to_string(), json!("object"));
++    }
++    let strict_marker = obj.get("additionalProperties") == Some(&json!(false));
++    let valid_required = obj
++        .get("required")
++        .is_some_and(|required| required.is_array());
++    if !valid_required {
++        if strict_marker {
++            obj.remove("additionalProperties");
++        }
++        obj.insert("required".to_string(), json!([]));
++    }
++    if let Some(properties) = obj
++        .get_mut("properties")
++        .and_then(|v| v.as_object_mut())
++    {
++        for value in properties.values_mut() {
++            sanitize_parameter_schema(value, false);
++        }
++    }
++    if let Some(items) = obj.get_mut("items") {
++        if let Some(array) = items.as_array_mut() {
++            for value in array.iter_mut() {
++                sanitize_parameter_schema(value, false);
++            }
++        } else {
++            sanitize_parameter_schema(items, false);
++        }
++    }
++}
